@@ -161,16 +161,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Maximize build space
-        uses: AdityaGarg8/remove-unwanted-software@v5
-        with:
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-          remove-large-packages: 'true'
-          remove-swapfile: 'true'
-          verbose: 'true'
+        run: |
+          echo "Disk before cleanup:"
+          df -h /
+          # Plain shell instead of AdityaGarg8/remove-unwanted-software:
+          # that action aborts on runner images whose apt package names
+          # differ (it just failed here with "Unable to locate package
+          # powershell"). These removals are the big, stable ones.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift || true
+          sudo apt-get clean || true
+          docker image prune -af || true
+          echo "Disk after cleanup:"
+          df -h /
 
       - name: Checkout code
         uses: actions/checkout@v6
@@ -260,6 +268,11 @@ jobs:
           [ "${{ steps.resolve-tag.outputs.is_lts }}" = "true" ] && ARGS="$ARGS --lts"
           ARGS="$ARGS --ksu-version ${{ github.event.inputs.kernelsu_version }}"
 
+          # This fork builds BakaSU as a loadable kernel module. Explicit
+          # here (BuildConfig also defaults to it) so the build log shows
+          # exactly what is being built. KPM/hide_stuff are SukiSU-only.
+          ARGS="$ARGS --bakasu-lkm --no-kpm --no-hide-stuff"
+
           [ "${{ github.event.inputs.use_zram }}" = "true" ] && ARGS="$ARGS --zram"
           [ "${{ github.event.inputs.use_kpm }}" = "false" ] && ARGS="$ARGS --no-kpm"
           [ "${{ github.event.inputs.use_mglru }}" = "false" ] && ARGS="$ARGS --no-mglru"
@@ -277,7 +290,6 @@ jobs:
           [ "${{ github.event.inputs.extra_net }}" = "true" ] && ARGS="$ARGS --extra-net"
           ARGS="$ARGS --bbr-version ${{ github.event.inputs.bbr_version }}"
           ARGS="$ARGS --lto-mode ${{ github.event.inputs.lto_mode }}"
-          [ -z "${{ github.event.inputs.kernelsu_commit }}" ] || ARGS="$ARGS --ksu-commit=${{ github.event.inputs.kernelsu_commit }}"
           [ -z "${{ github.event.inputs.susfs_commit }}" ] || ARGS="$ARGS --susfs-commit=${{ github.event.inputs.susfs_commit }}"
           [ -z "${{ github.event.inputs.custom_version }}" ] || ARGS="$ARGS --custom-version=${{ github.event.inputs.custom_version }}"
           [ "${{ github.event.inputs.make_release }}" = "true" ] || ARGS="$ARGS --no-release"
@@ -289,6 +301,7 @@ jobs:
           mkdir -p artifacts
           find /tmp/gki-build -name "*AnyKernel3*.zip" -type f -exec cp {} artifacts/ \;
           find /tmp/gki-build -name "*-boot.img" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "kernelsu-*.ko" -type f -exec cp {} artifacts/ \;
           find /tmp/gki-build -name "crypto_zstdn_o.ko" -type f -exec cp {} artifacts/ \;
           find /tmp/gki-build -name "oplus_bsp_*.ko" -type f -exec cp {} artifacts/ \;
           find /tmp/gki-build -name "*-modules.zip" -type f -exec cp {} artifacts/ \;
