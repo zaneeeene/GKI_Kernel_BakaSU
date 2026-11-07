@@ -60,6 +60,18 @@ def parse_args() -> argparse.Namespace:
                              "Branches with no entry build from their branch HEAD.")
     parser.add_argument("--zram", action="store_true")
     parser.add_argument("--no-kpm", action="store_true")
+    parser.add_argument("--bakasu-lkm", dest="bakasu_lkm", action="store_true", default=True,
+                        help="Build BakaSU as a loadable kernel module (CONFIG_KSU=m) "
+                             "instead of compiling SukiSU-Ultra into the Image. Implies "
+                             "--no-kpm and --no-hide-stuff, and skips the in-tree SUSFS "
+                             "patches - pair it with susfs_guard_lkm.ko for SUSFS. "
+                             "Enabled by default in this fork.")
+    parser.add_argument("--no-bakasu-lkm", dest="bakasu_lkm", action="store_false",
+                        help="Opt out of BakaSU LKM mode and build SukiSU-Ultra in-tree "
+                             "as upstream does.")
+    parser.add_argument("--bakasu-ref", default=None,
+                        help="BakaSU git ref (branch/tag/commit) to build in "
+                             "--bakasu-lkm mode. Defaults to 'main'.")
     parser.add_argument("--no-mglru", action="store_true",
                         help="Disable MGLRU (Multi-Gen LRU memory reclaim). On by default.")
     parser.add_argument("--no-psi", action="store_true",
@@ -208,7 +220,8 @@ def create_build_config(args: argparse.Namespace) -> BuildConfig:
         susfs_commit=args.susfs_commit,
         use_zram=args.zram,
         use_kpm=not args.no_kpm,
-        use_mglru=not args.no_mglru,
+        use_bakasu_lkm=args.bakasu_lkm,
+        bakasu_ref=args.bakasu_ref,        use_mglru=not args.no_mglru,
         use_psi=not args.no_psi,
         use_ntsync=not args.no_ntsync,
         use_hide_stuff=not args.no_hide_stuff,

@@ -102,6 +102,25 @@ KSU_REPO_CONFIG = {"repo_url": "https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
                     "branch": "main",
                     "setup_script": "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh"}
 
+# BakaSU (formerly ReSukiSU) configuration - used when --bakasu-lkm is set.
+#
+# BakaSU is a KernelSU/SukiSU-Ultra downstream. Its kernel driver can be built
+# as a loadable module (CONFIG_KSU=m), which is what "BakaSU LKM" means: the
+# kernel image stays free of the root driver, and a separate kernelsu.ko is
+# loaded from the ramdisk (or via ksud insmod) at boot.
+#
+# IMPORTANT: BakaSU's *in-tree SUSFS* mode (CONFIG_KSU_SUSFS) is an alternative
+# hooking method that embeds ksu_handle_* calls into the kernel image. Those
+# symbols live in the KSU driver, so they only link when CONFIG_KSU=y. With
+# CONFIG_KSU=m the kernel must stay SUSFS-free; SUSFS is then supplied by the
+# separate susfs_guard_lkm.ko from inforcqb/susfs4ksu-lkm.
+BAKASU_REPO_CONFIG = {"repo_url": "https://github.com/Baka-SU/BakaSU.git",
+                      "branch": "main",
+                      "setup_script": "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh"}
+
+# Default BakaSU ref used when --bakasu-lkm is requested without --bakasu-ref.
+DEFAULT_BAKASU_REF = "main"
+
 # SUSFS repository configuration
 #
 # ShirkNeko's GitHub fork only carries branches up to gki-android15-6.6 -
@@ -159,6 +178,12 @@ class BuildConfig:
     susfs_commit: Optional[str] = None
     use_zram: bool = False
     use_kpm: bool = True
+    # Build BakaSU as a loadable kernel module (CONFIG_KSU=m) instead of
+    # compiling SukiSU-Ultra into the Image. In this mode SUSFS is not
+    # patched into the kernel; use susfs_guard_lkm.ko instead. KPM is
+    # SukiSU-specific and is automatically disabled.
+    use_bakasu_lkm: bool = False
+    bakasu_ref: Optional[str] = None
     use_mglru: bool = True
     use_psi: bool = True
     use_ntsync: bool = True
@@ -220,6 +245,15 @@ class BuildConfig:
     use_hide_stuff: bool = True
 
     def __post_init__(self):
+        # BakaSU LKM mode is mutually exclusive with SukiSU-only features.
+        # KPM only exists in SukiSU-Ultra; 69_hide_stuff.patch is written
+        # against SukiSU's SUSFS tree. Leaving either enabled would make
+        # the build apply patches to a driver tree that isn't there.
+        if self.use_bakasu_lkm:
+            self.use_kpm = False
+            self.use_hide_stuff = False
+            if not self.bakasu_ref:
+                self.bakasu_ref = DEFAULT_BAKASU_REF
         self._validate_android_version()
         self._validate_kernel_version()
         self._validate_kernel_android_compat()
@@ -296,6 +330,8 @@ class BuildConfig:
             "kernelsu_commit": self.kernelsu_commit,
             "use_zram": self.use_zram,
             "use_kpm": self.use_kpm,
+            "use_bakasu_lkm": self.use_bakasu_lkm,
+            "bakasu_ref": self.bakasu_ref,
             "use_mglru": self.use_mglru,
             "use_psi": self.use_psi,
             "use_ntsync": self.use_ntsync,

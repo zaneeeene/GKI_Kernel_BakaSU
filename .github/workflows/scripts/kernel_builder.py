@@ -4,6 +4,8 @@ import logging
 import re
 import threading
 import time as _time
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass, field
@@ -11,7 +13,8 @@ from dataclasses import dataclass, field
 from config import (BuildConfig, KSU_REPO_CONFIG, SUSFS_REPO_CONFIG, SUKISU_PATCH_REPO_CONFIG,
                    DEFAULT_KSU_REF, SUSFS_UPSTREAM_URL, SUSFS_BRANCH_REPOS,
                    ANYKERNEL_CONFIG, KERNEL_PATCHES_CONFIG, BBG_CONFIG, TOOLCHAIN_CONFIG,
-                   LEGACY_FIXES, OP8E_PATCH_URL, KPM_PATCH_URL)
+                   LEGACY_FIXES, OP8E_PATCH_URL, KPM_PATCH_URL,
+                   BAKASU_REPO_CONFIG, DEFAULT_BAKASU_REF)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -284,6 +287,31 @@ CONFIG_CIFS_XATTR=y
     # kernel_version) so this stays explicit rather than an inequality
     # that silently starts including a branch nobody checked.
     FUSE_BPF_UNSUPPORTED = {("android12", "5.10")}
+
+    # Extra Kconfig written only in --bakasu-lkm mode.
+    #
+    # CONFIG_KSU=m              - driver is a loadable module (kernelsu.ko)
+    # CONFIG_KSU_TRACEPOINT_HOOK - the only hook method that works for LKM
+    #                              (KSU_MANUAL_HOOK has `depends on KSU != m`;
+    #                              KSU_SUSFS embeds kernel-image calls that
+    #                              need CONFIG_KSU=y)
+    # CONFIG_FTRACE_SYSCALLS    - supplies the sys_enter/sys_exit tracepoints
+    #                             BakaSU's syscall hook manager registers against
+    # CONFIG_KPROBES/KRETPROBES - BakaSU's tracepoint manager kretprobes
+    #                             syscall_regfunc/syscall_unregfunc
+    # CONFIG_KALLSYMS_ALL       - lets the LKM's dynamic symbol resolver see
+    #                             non-exported symbols (stock GKI already sets it)
+    BAKASU_LKM_CONFIG = """
+# === BakaSU LKM mode (--bakasu-lkm) ===
+CONFIG_KSU=m
+CONFIG_KSU_TRACEPOINT_HOOK=y
+CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
+CONFIG_FTRACE_SYSCALLS=y
+CONFIG_KPROBES=y
+CONFIG_KRETPROBES=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+"""
 
     ZRAM_CONFIG_5_10 = "CONFIG_ZSMALLOC=y\nCONFIG_ZRAM=y\nCONFIG_MODULE_SIG=n\nCONFIG_CRYPTO_LZO=y\nCONFIG_ZRAM_DEF_COMP_LZ4KD=y\n"
     ZRAM_CONFIG_COMMON = "CONFIG_CRYPTO_LZ4HC=y\nCONFIG_CRYPTO_LZ4K=y\nCONFIG_CRYPTO_LZ4KD=y\nCONFIG_CRYPTO_842=y\nCONFIG_CRYPTO_LZ4K_OPLUS=y\nCONFIG_ZRAM_WRITEBACK=y\n"
@@ -599,6 +627,13 @@ CONFIG_CIFS_XATTR=y
             ("AnyKernel3", self.anykernel_dir, ANYKERNEL_CONFIG['repo_url'], ANYKERNEL_CONFIG['branch']),
             ("Kernel Patches", self.kernel_patches_dir, KERNEL_PATCHES_CONFIG['repo_url'], None),
         ]:
+            if self.config.use_bakasu_lkm and name == "SUSFS":
+                # In LKM mode no in-tree SUSFS patch is applied, so the
+                # susfs4ksu checkout is dead weight (and a needless way
+                # for the build to fail on a branch that isn't used).
+                logger.info("Skipping SUSFS clone - BakaSU LKM mode uses "
+                            "susfs_guard_lkm.ko instead of in-tree patches")
+                continue
             if not repo_dir.exists():
                 cmd = f"git clone {url}"
                 if branch:
@@ -670,8 +705,12 @@ CONFIG_CIFS_XATTR=y
                             f"Failing here instead of continuing into a long kernel "
                             f"repo sync that would fail later anyway."
                         )
-        self._apply_susfs_commit()
-        self._verify_susfs_branch_layout()
+        if self.config.use_bakasu_lkm:
+            self._mark("susfs_pin", "skipped",
+                       "BakaSU LKM mode: no susfs4ksu checkout to pin")
+        else:
+            self._apply_susfs_commit()
+            self._verify_susfs_branch_layout()
         self._log_shared_repo_revisions()
         logger.info("=== Repository cloning complete ===")
 
@@ -1111,6 +1150,74 @@ CONFIG_CIFS_XATTR=y
             with open(drivers_dir / "Makefile", "a") as f:
                 f.write("obj-y += hmbird_patch.o\n")
 
+    def _add_bakasu(self):
+        """Clones BakaSU and wires its driver into drivers/kernelsu.
+
+        This mirrors add_kernelsu(), but uses BakaSU's setup.sh instead of
+        SukiSU-Ultra's. BakaSU's script is functionally the same shape:
+        clone to $GKI_ROOT/KernelSU, symlink KernelSU/kernel into
+        drivers/kernelsu, and append the Makefile/Kconfig entries. The
+        module is then built in-tree as kernelsu.ko because the config
+        sets CONFIG_KSU=m (see BAKASU_LKM_CONFIG).
+        """
+        logger.info("=== Adding BakaSU (LKM mode) ===")
+        self._chdir(self.work_dir)
+        ref = self.config.bakasu_ref or DEFAULT_BAKASU_REF
+        ksu_dir = self.work_dir / "KernelSU"
+
+        # setup.sh updates an existing KernelSU/ checkout instead of
+        # re-cloning it, so a leftover SukiSU-Ultra clone from an earlier
+        # run would be silently "updated" and then built. Drop it unless
+        # it really is BakaSU.
+        if ksu_dir.exists():
+            remote = self._run_cmd(f"git -C {ksu_dir} remote get-url origin",
+                                   check=False, capture_output=True)
+            origin = (remote.stdout or "").strip()
+            if "Baka-SU/BakaSU" not in origin:
+                logger.warning(
+                    f"Existing KernelSU/ checkout is not BakaSU ({origin or 'no origin'}) - "
+                    f"removing it before the BakaSU setup"
+                )
+                self._run_cmd(f"rm -rf {ksu_dir}", check=False)
+
+        setup_url = BAKASU_REPO_CONFIG["setup_script"]
+        result = self._run_cmd(f"curl -LSsf {setup_url} | bash -s {ref}", check=False)
+        if result.returncode != 0 or not ksu_dir.exists():
+            raise RuntimeError(
+                f"BakaSU setup.sh failed (exit code {result.returncode}) or did "
+                f"not create {ksu_dir}. Check that the ref '{ref}' exists at "
+                f"https://github.com/Baka-SU/BakaSU and that the drivers/ tree "
+                f"is present in the synced kernel."
+            )
+
+        # setup.sh swallows a failed checkout, exactly like SukiSU's does.
+        # Verify the ref explicitly so a typo cannot silently build main.
+        self._chdir(ksu_dir)
+        checkout = self._run_cmd(f"git checkout {ref}", check=False)
+        if checkout.returncode != 0:
+            self._chdir(self.work_dir)
+            raise RuntimeError(
+                f"BakaSU ref '{ref}' could not be checked out. Check available "
+                f"branches/tags at https://github.com/Baka-SU/BakaSU."
+            )
+        landed = self._run_cmd("git rev-parse HEAD", check=False, capture_output=True)
+        described = self._run_cmd("git describe --tags --always", check=False, capture_output=True)
+        self._chdir(self.work_dir)
+
+        if not (self.work_dir / "common/drivers/kernelsu").exists() and \
+           not (self.work_dir / "drivers/kernelsu").exists():
+            raise RuntimeError(
+                "BakaSU setup.sh ran but drivers/kernelsu was not created - "
+                "the driver would never be compiled into the build."
+            )
+
+        logger.info(
+            f"BakaSU pinned to {ref} -> {(described.stdout or '').strip()} "
+            f"({(landed.stdout or '').strip()[:12]})"
+        )
+        self._mark("bakasu_ref", "applied",
+                   f"{ref} -> {(described.stdout or '').strip()}")
+
     def add_kernelsu(self):
         """Pulls in SukiSU-Ultra's kernel-side driver source.
 
@@ -1129,6 +1236,9 @@ CONFIG_CIFS_XATTR=y
         DIFFERENT, KernelSU/SukiSU-Ultra version while the build still
         claims to be the one that was asked for.
         """
+        if self.config.use_bakasu_lkm:
+            self._add_bakasu()
+            return
         logger.info("=== Adding KernelSU ===")
         self._chdir(self.work_dir)
         setup_url = (f"https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/{self.config.kernelsu_commit}/kernel/setup.sh"
@@ -3400,6 +3510,23 @@ CONFIG_CIFS_XATTR=y
         finally:
             _shutil.rmtree(build_tmp, ignore_errors=True)
 
+    def _bakasu_kernel_config_template(self) -> str:
+        """KERNEL_CONFIG_TEMPLATE with the SukiSU-only symbols removed.
+
+        In LKM mode there is no SukiSU-Ultra driver in the tree, so:
+          * CONFIG_KSU=y would try to link a built-in driver,
+          * CONFIG_KPM has no Kconfig definition (it is SukiSU-only),
+          * every CONFIG_KSU_SUSFS* symbol belongs to BakaSU's in-tree
+            SUSFS hook method, which cannot link with CONFIG_KSU=m.
+        Writing any of them would either break the build or be silently
+        dropped by Kconfig. Remove them and append BAKASU_LKM_CONFIG.
+        """
+        lines = [
+            line for line in self.KERNEL_CONFIG_TEMPLATE.splitlines()
+            if not line.startswith(("CONFIG_KSU=", "CONFIG_KPM=", "CONFIG_KSU_SUSFS"))
+        ]
+        return "\n".join(lines) + "\n" + self.BAKASU_LKM_CONFIG
+
     def configure_kernel(self):
         logger.info("=== Configuring kernel ===")
         self._chdir(self.work_dir)
@@ -3408,12 +3535,17 @@ CONFIG_CIFS_XATTR=y
             logger.warning(f"Config file does not exist: {config_file}")
             return
 
+        config_template = self.KERNEL_CONFIG_TEMPLATE
+        if self.config.use_bakasu_lkm:
+            config_template = self._bakasu_kernel_config_template()
+
         with open(config_file, "a") as f:
-            f.write(self.KERNEL_CONFIG_TEMPLATE)
-            if self.config.kernel_version != "6.6":
-                f.write("CONFIG_KSU_SUSFS_SUS_PATH=y\n")
-            else:
-                f.write("CONFIG_KSU_SUSFS_SUS_PATH=n\n")
+            f.write(config_template)
+            if not self.config.use_bakasu_lkm:
+                if self.config.kernel_version != "6.6":
+                    f.write("CONFIG_KSU_SUSFS_SUS_PATH=y\n")
+                else:
+                    f.write("CONFIG_KSU_SUSFS_SUS_PATH=n\n")
             # FUSE-BPF: only exists from android13 onwards. Writing it on
             # android12-5.10 would be a reference to an undefined Kconfig
             # symbol, which Kconfig drops in silence - the exact failure
@@ -3968,8 +4100,12 @@ CONFIG_CIFS_XATTR=y
         respin. Bazel/Kleaf branches stay untagged ("") since LTO mode
         there is fixed upstream (see build_kernel()), not user-chosen."""
         if (self.work_dir / "build/build.sh").exists() and self.config.lto_mode == "full":
-            return "-lto-full"
-        return ""
+            suffix = "-lto-full"
+        else:
+            suffix = ""
+        if self.config.use_bakasu_lkm:
+            suffix += "-bakasu-lkm"
+        return suffix
 
     @property
     def oplus_suffix(self) -> str:
@@ -4337,7 +4473,15 @@ CONFIG_CIFS_XATTR=y
         # hard-to-notice failure mode - but gate them the same way, or
         # the check starts failing correct builds, which trains people
         # to ignore it.
-        checks = [("SUSFS", "fs/susfs.o")]
+        checks = []
+        if not self.config.use_bakasu_lkm:
+            checks.append(("SUSFS", "fs/susfs.o"))
+        else:
+            logger.info(
+                "Skipping in-tree SUSFS object check - BakaSU LKM mode "
+                "intentionally builds no fs/susfs.o (SUSFS is loaded as "
+                "susfs_guard_lkm.ko instead)."
+            )
         if self._has_fuse_bpf():
             checks.append(("FUSE-BPF", "fs/fuse/backing.o"))
         else:
@@ -4453,30 +4597,47 @@ CONFIG_CIFS_XATTR=y
     # that for two specific files; this catches it for every feature
     # flag at once, which is the generalisable half of the same lesson.
     def _expected_config_symbols(self) -> list:
-        symbols = [
-            ("CONFIG_KSU", True),
-            ("CONFIG_KSU_SUSFS", True),
-            # All nine SUSFS symbols, not a sample. A device check found
-            # four options being written into gki_defconfig that upstream
-            # had already deprecated - they were absent from the built
-            # kernel and nothing noticed, because the two SUSFS symbols
-            # spot-checked here happened to be survivors. Listing the
-            # full set means the next upstream removal shows up on the
-            # first build after it happens.
-            # configure_kernel() deliberately writes
-            # CONFIG_KSU_SUSFS_SUS_PATH=n on 6.6 ("6.6 needs it off"), so
-            # expecting it there turns a deliberate choice into a reported
-            # failure. Expect it only where we actually ask for it.
-        ] + ([("CONFIG_KSU_SUSFS_SUS_PATH", False)]
-             if self.config.kernel_version != "6.6" else []) + [
-            ("CONFIG_KSU_SUSFS_SUS_MAP", False),
-            ("CONFIG_KSU_SUSFS_SUS_MOUNT", False),
-            ("CONFIG_KSU_SUSFS_SUS_KSTAT", False),
-            ("CONFIG_KSU_SUSFS_SPOOF_UNAME", False),
-            ("CONFIG_KSU_SUSFS_ENABLE_LOG", False),
-            ("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS", False),
-            ("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG", False),
-            ("CONFIG_KSU_SUSFS_OPEN_REDIRECT", False),
+        symbols = [("CONFIG_KSU", True)]
+        if self.config.use_bakasu_lkm:
+            # BakaSU LKM: CONFIG_KSU must survive as =m, and the syscall
+            # tracepoint/kprobe machinery its tracepoint hook depends on
+            # must be present. None of the CONFIG_KSU_SUSFS* symbols exist
+            # in this mode - SUSFS comes from susfs_guard_lkm.ko instead.
+            symbols.extend([
+                ("CONFIG_KSU_TRACEPOINT_HOOK", True),
+                ("CONFIG_FTRACE_SYSCALLS", True),
+                ("CONFIG_KPROBES", False),
+                ("CONFIG_KRETPROBES", False),
+                ("CONFIG_KALLSYMS_ALL", False),
+            ])
+        else:
+            symbols.extend([
+                ("CONFIG_KSU_SUSFS", True),
+                # All nine SUSFS symbols, not a sample. A device check found
+                # four options being written into gki_defconfig that upstream
+                # had already deprecated - they were absent from the built
+                # kernel and nothing noticed, because the two SUSFS symbols
+                # spot-checked here happened to be survivors. Listing the
+                # full set means the next upstream removal shows up on the
+                # first build after it happens.
+                # configure_kernel() deliberately writes
+                # CONFIG_KSU_SUSFS_SUS_PATH=n on 6.6 ("6.6 needs it off"), so
+                # expecting it there turns a deliberate choice into a reported
+                # failure. Expect it only where we actually ask for it.
+            ])
+            if self.config.kernel_version != "6.6":
+                symbols.append(("CONFIG_KSU_SUSFS_SUS_PATH", False))
+            symbols.extend([
+                ("CONFIG_KSU_SUSFS_SUS_MAP", False),
+                ("CONFIG_KSU_SUSFS_SUS_MOUNT", False),
+                ("CONFIG_KSU_SUSFS_SUS_KSTAT", False),
+                ("CONFIG_KSU_SUSFS_SPOOF_UNAME", False),
+                ("CONFIG_KSU_SUSFS_ENABLE_LOG", False),
+                ("CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS", False),
+                ("CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG", False),
+                ("CONFIG_KSU_SUSFS_OPEN_REDIRECT", False),
+            ])
+        symbols.extend([
             ("CONFIG_WIREGUARD", False),
             ("CONFIG_IP_SET", False),
             ("CONFIG_NET_SCH_CAKE", False),
@@ -4485,8 +4646,8 @@ CONFIG_CIFS_XATTR=y
             ("CONFIG_TMPFS_XATTR", False),
             ("CONFIG_DEBUG_INFO_BTF", False),
             ("CONFIG_BPF_EVENTS", False),
-        ]
-        if self.config.use_kpm:
+        ])
+        if self.config.use_kpm and not self.config.use_bakasu_lkm:
             symbols.append(("CONFIG_KPM", False))
         if self._has_fuse_bpf():
             symbols.append(("CONFIG_FUSE_BPF", True))
@@ -4856,6 +5017,148 @@ CONFIG_CIFS_XATTR=y
         if (image_dir / "oImage").exists():
             self._run_cmd("mv oImage Image", check=False)
 
+    def collect_bakasu_module(self) -> list:
+        """Collects the in-tree-built BakaSU driver module.
+
+        With CONFIG_KSU=m the kernel's own `modules` target produces
+        drivers/kernelsu/kernelsu.ko under the out/ tree. That .ko is the
+        whole point of LKM mode, so a build that reports success but
+        produced no module is a hard failure here rather than a release
+        with a silently missing root driver.
+        """
+        if not self.config.use_bakasu_lkm:
+            return []
+        logger.info("=== BakaSU LKM: collecting kernelsu.ko ===")
+        out_dir = self.work_dir / "out"
+        if not out_dir.exists():
+            raise RuntimeError(
+                f"BakaSU LKM: {out_dir} does not exist - nothing was built, "
+                f"so there is no kernelsu.ko to package."
+            )
+        candidates = list(out_dir.rglob("kernelsu.ko"))
+        # A copy under staging is stripped/signed; prefer it if present,
+        # but the freshly linked module in the kernel tree is fine too.
+        candidates.sort(key=lambda p: (0 if "staging" in p.parts else 1, len(p.parts)))
+        if not candidates:
+            raise RuntimeError(
+                "BakaSU LKM was requested (CONFIG_KSU=m) but no kernelsu.ko "
+                "was produced under out/. Kconfig may have dropped CONFIG_KSU=m, "
+                "or the build did not run the kernel's `modules` target. "
+                "Refusing to ship a kernel that claims LKM support without "
+                "its module."
+            )
+        src = candidates[0]
+        dest = self.work_dir / (
+            f"kernelsu-{self.config.android_version}-{self.config.kernel_version}.ko")
+        self._run_cmd(f"cp {src} {dest}", check=False)
+        if not dest.exists() or dest.stat().st_size == 0:
+            raise RuntimeError(f"BakaSU LKM: failed to copy {src} to {dest}")
+        logger.info(f"BakaSU LKM ready: {dest} "
+                    f"({dest.stat().st_size} bytes, from {src})")
+        self._mark("bakasu_lkm_module", "applied", f"{src} -> {dest.name}")
+        return [str(dest)]
+
+    # Pinned SUSFS-LKM release used when running BakaSU in LKM mode.
+    # This is the supported way to get SUSFS when there is no in-tree
+    # CONFIG_KSU_SUSFS: a separate module loaded after root is up.
+    SUSFS_LKM_TAG = "v2.3.0-r18.8"
+    SUSFS_LKM_BASE = "https://github.com/inforcqb/susfs4ksu-lkm/releases/download"
+
+    def _fetch_susfs_lkm(self, dest_dir: Path):
+        """Best-effort download of the matching SUSFS-LKM .ko and module zip.
+
+        SUSFS is optional in LKM mode; a network failure here must not
+        fail the kernel build. Returns (ko_path|None, module_zip|None).
+        """
+        kmi = f"{self.config.android_version}-{self.config.kernel_version}"
+        base = f"{self.SUSFS_LKM_BASE}/{self.SUSFS_LKM_TAG}"
+        ko_name = f"susfs_guard_lkm-{kmi}.ko"
+        mod_name = f"susfs_guard_lkm-module-{self.SUSFS_LKM_TAG}-arm64.zip"
+        ko_path = dest_dir / ko_name
+        # Renamed so the workflow's existing "*-modules.zip" collector
+        # picks it up as a separate, flashable KernelSU module.
+        mod_path = dest_dir / "susfs_guard_lkm-modules.zip"
+        for url, path in ((f"{base}/{ko_name}", ko_path),
+                          (f"{base}/{mod_name}", mod_path)):
+            if path.exists() and path.stat().st_size > 0:
+                continue
+            try:
+                logger.info(f"BakaSU LKM: fetching {url}")
+                urllib.request.urlretrieve(url, path)
+            except Exception as e:
+                logger.warning(
+                    f"BakaSU LKM: could not fetch {url} ({e}) - SUSFS-LKM "
+                    f"will not be bundled; the kernel build itself is unaffected"
+                )
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        return (ko_path if ko_path.exists() else None,
+                mod_path if mod_path.exists() else None)
+
+    def create_bakasu_lkm_bundle(self) -> list:
+        """Packages kernelsu.ko (+ optional SUSFS-LKM) into *-modules.zip.
+
+        The stock workflow collects artifacts with a recursive find for
+        `*-modules.zip`, so naming the bundle this way gets it uploaded
+        without touching .github/workflows (which needs a token with the
+        `workflow` scope).
+        """
+        if not self.config.use_bakasu_lkm:
+            return []
+        ko = self.work_dir / (
+            f"kernelsu-{self.config.android_version}-{self.config.kernel_version}.ko")
+        if not ko.exists():
+            raise RuntimeError(
+                f"BakaSU LKM bundle: {ko} is missing - collect_bakasu_module() "
+                f"must run successfully before packaging."
+            )
+        susfs_ko, susfs_mod = self._fetch_susfs_lkm(self.work_dir)
+        bundle = self.work_dir / (
+            f"{self.config.android_version}-{self.config.kernel_version}."
+            f"{self.config.sub_level}-{self.config.os_patch_level}"
+            f"{self.artifact_suffix}-modules.zip")
+        kmi = f"{self.config.android_version}-{self.config.kernel_version}"
+        readme = (
+            "BakaSU LKM bundle\n"
+            "=================\n"
+            f"kernel under test : {self.config.config_name} "
+            f"({self.config.sub_level}, {self.config.os_patch_level})\n"
+            "kernelsu.ko       : BakaSU driver built from this exact kernel tree\n"
+            f"kmi               : {kmi}\n\n"
+            "Install\n"
+            "-------\n"
+            "1. Flash the kernel (boot.img via fastboot, or the AnyKernel3 zip).\n"
+            "2. Install the BakaSU manager and open it.\n"
+            "3. Tap 'Not installed' -> LKM patching, select the stock\n"
+            "   init_boot (or vendor_boot) image matching your firmware, and\n"
+            "   flash the patched image it writes.\n"
+            "   Advanced alternative: `ksud boot-patch --module kernelsu.ko ...`\n"
+            "   with the driver in this bundle.\n"
+            "4. Reboot and confirm root in the manager.\n\n"
+            "SUSFS\n"
+            "-----\n"
+            f"If susfs_guard_lkm-{kmi}.ko is present, SUSFS is supplied as a\n"
+            "separate LKM (in-tree SUSFS is intentionally absent in LKM mode).\n"
+            "Flash susfs_guard_lkm-modules.zip in the manager and reboot, or\n"
+            f"`ksud insmod susfs_guard_lkm-{kmi}.ko`.\n\n"
+            "Note: the kernel itself must be flashed before the LKM is loaded;\n"
+            "the LKM does not replace the kernel image.\n"
+        )
+        with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(ko, arcname="kernelsu.ko")
+            if susfs_ko:
+                z.write(susfs_ko, arcname=susfs_ko.name)
+            z.writestr("README.txt", readme)
+        logger.info(f"BakaSU LKM bundle ready: {bundle}")
+        artifacts = [str(bundle)]
+        if susfs_mod:
+            logger.info(f"SUSFS-LKM module zip ready: {susfs_mod}")
+            artifacts.append(str(susfs_mod))
+        self._mark("bakasu_lkm_bundle", "applied", bundle.name)
+        return artifacts
+
     def prepare_boot_images(self) -> list:
         logger.info("=== Preparing boot images ===")
         self._chdir(self.work_dir)
@@ -5055,19 +5358,40 @@ CONFIG_CIFS_XATTR=y
                 self._mark("ntsync", "skipped", "not requested")
             self.add_kernel_supatch()
             self.add_kernelsu()
-            self._pin_ksu_version_code()
-            if self.config.disable_safemode:
+            if self.config.use_bakasu_lkm:
+                self._mark("ksu_version_code", "skipped",
+                           "BakaSU derives its version from git; SukiSU pinning not applicable")
+            else:
+                self._pin_ksu_version_code()
+            if self.config.disable_safemode and not self.config.use_bakasu_lkm:
                 self.apply_safemode_patch()
             else:
-                self._mark("safemode_disable", "skipped", "not requested")
+                self._mark("safemode_disable", "skipped",
+                           "not applicable in BakaSU LKM mode" if self.config.use_bakasu_lkm and self.config.disable_safemode
+                           else "not requested")
             self.add_bbg()
             self.add_vendor_module_blacklist()
-            self.apply_susfs_patches()
-            self.apply_susfs_kernelsu_patch()
-            self._fix_selinux_hide_always_true_guards()
-            self.apply_sukisu_patches()
+            if self.config.use_bakasu_lkm:
+                # BakaSU LKM deliberately ships no in-tree SUSFS: its
+                # inline-hook SUSFS method embeds ksu_handle_* calls in the
+                # kernel image, which cannot resolve against a module. SUSFS
+                # comes from susfs_guard_lkm.ko at runtime instead.
+                self._mark("susfs", "skipped",
+                           "BakaSU LKM mode: SUSFS supplied by susfs_guard_lkm.ko")
+                self._mark("susfs_kernelsu_integration", "skipped",
+                           "BakaSU already has its own SUSFS integration")
+                self._mark("sukisu_hide_stuff", "skipped",
+                           "SukiSU_patch is not used in BakaSU LKM mode")
+                self._mark("task_mmu_fixes", "skipped",
+                           "task_mmu edits are only needed for in-tree SUSFS")
+            else:
+                self.apply_susfs_patches()
+                self.apply_susfs_kernelsu_patch()
+                self._fix_selinux_hide_always_true_guards()
+                self.apply_sukisu_patches()
             self.apply_zram_patches()
-            self.apply_task_mmu_fixes()
+            if not self.config.use_bakasu_lkm:
+                self.apply_task_mmu_fixes()
             # Applied last, deliberately after SUSFS/SukiSU: Droidspaces'
             # kABI patch and SUSFS both potentially touch the same
             # ANDROID_KABI_RESERVE slots in include/linux/sched.h. If
@@ -5112,6 +5436,8 @@ CONFIG_CIFS_XATTR=y
             ath9k_artifacts = self.collect_ath9k_modules()
             oplus_artifacts = self.collect_oplus_modules()
             oplus_zip_artifacts = self.create_oplus_modules_zip()
+            bakasu_artifacts = self.collect_bakasu_module()
+            bakasu_bundle_artifacts = self.create_bakasu_lkm_bundle()
 
             # Rewritten now that the build is done: the earlier call
             # happens before compilation (so a hard patch failure still
@@ -5126,6 +5452,8 @@ CONFIG_CIFS_XATTR=y
             artifacts.extend(ath9k_artifacts)
             artifacts.extend(oplus_artifacts)
             artifacts.extend(oplus_zip_artifacts)
+            artifacts.extend(bakasu_artifacts)
+            artifacts.extend(bakasu_bundle_artifacts)
             artifacts.extend(self.prepare_boot_images())
             artifacts.extend(self.create_anykernel_zips())
 
