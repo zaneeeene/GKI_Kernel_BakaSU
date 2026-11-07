@@ -4312,7 +4312,16 @@ CONFIG_KALLSYMS_ALL=y
                 # below. 'full' means a single-threaded, RAM-heavy link
                 # step (can need 16GB+ and much longer wall-clock time),
                 # so it's opt-in via --lto-mode full rather than default.
-                return (f"LTO={self.config.lto_mode} BUILD_CONFIG=common/build.config.gki.aarch64 "
+                # BakaSU LKM references non-exported kernel symbols on
+                # purpose (kallsyms_lookup_name, __tracepoint_sys_enter,
+                # init_mm, ...). ksud insmod resolves and rewrites them at
+                # load time; modpost must therefore warn instead of
+                # failing the whole build. This is the same unresolved-
+                # symbol allowance BakaSU's own DDK build gets by
+                # patching scripts/mod/modpost.c, expressed with the
+                # kernel's supported KBUILD_MODPOST_WARN switch.
+                warn = "KBUILD_MODPOST_WARN=1 " if self.config.use_bakasu_lkm else ""
+                return (f"{warn}LTO={self.config.lto_mode} BUILD_CONFIG=common/build.config.gki.aarch64 "
                         f"build/build.sh CC=\"/usr/bin/ccache clang\"")
             # Building //common:kernel_aarch64/Image directly (instead of
             # the full //common:kernel_aarch64_dist target) matches
@@ -4393,6 +4402,13 @@ CONFIG_KALLSYMS_ALL=y
             # full stop. The LTO mode itself is chosen upfront per branch
             # above (thin where proven, Bazel default where thin is known
             # to hit the verifier bug), not switched after a failed attempt.
+            if self.config.use_bakasu_lkm:
+                # Belt-and-braces: build.sh sanitizes PATH and toolchain
+                # variables, so also place it in the environment this
+                # ShellCommand passes to the build, not just the command
+                # string prefix.
+                self.env["KBUILD_MODPOST_WARN"] = "1"
+                self.shell.env = self.env
             success, output = self._run_build_command(_build_cmd())
 
             build_seconds = time.time() - start_time
