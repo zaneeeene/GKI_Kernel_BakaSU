@@ -1,6 +1,6 @@
 # oplusnize — GKI Kernel with OPlus backports
 
-An automated build system for **GKI kernels** with **SukiSU-Ultra**, **SUSFS** and backported **OPlus** features (binder strategy, kswapd_opt, kprobe framework, zstd, memory opts), built and daily-driven on the **Poco F6 Pro / Redmi K70 (`vermeer`)**.
+An automated build system for **GKI kernels** with **BakaSU**, **SUSFS** and backported **OPlus** features (binder strategy, kswapd_opt, kprobe framework, zstd, memory opts), built for the **Redmi Note 12 4G (`tapas`)**.
 
 Python-assisted pipeline with automatic GKI respin tracking (including LTS-merge respins, not just date-based ones), exact source pinning, AVB signing, and dependency auto-installation for local builds. On-device kernel name carries the `_@oplusnize` marker; artifacts carry `-oplusnize` in the filename.
 
@@ -8,18 +8,18 @@ Python-assisted pipeline with automatic GKI respin tracking (including LTS-merge
 
 ## ⚠️ Scope — read this first
 
-This project is developed, built and tested for **one target: `android13-5.15` on the Poco F6 Pro / Redmi K70 (`vermeer`)**. That is the only configuration actually flashed and run.
+This fork is developed and built for **one target: `android13-5.15` on the Redmi Note 12 4G (`tapas`)**. The kernel image and the BakaSU LKM are built for that target; keep a working boot.img and init_boot.img backup before flashing.
 
 | Target | Status |
 |--------|--------|
-| `android13-5.15` on `vermeer` (Poco F6 Pro / K70) | **Built, flashed, tested, daily-driven.** This is the project. |
+| `android13-5.15` on `tapas` (Redmi Note 12 4G) | **Build target. Current build: `5.15.216-android13_@oplusnize-lts`, BakaSU LKM.** Flash with backups. |
 | Other `android13-5.15` GKI devices | Should boot (standard GKI + HW-independent, KMI-safe additions), but **untested** — your risk, keep a working boot.img backup. |
 | `android12-5.10`, `android14-6.1` | Tracked in the matrix, scripts attempt them, **untested**. |
 | `android15-6.6` and newer | **Known broken** — build fails. Left disabled. |
 
-- Current tested release: `android13-5.15.211` (LTS), tag `android13-5.15.211_r00`, kernel string `5.15.211-android13-r00-lts`.
+- Current build: `android13-5.15.216` (LTS), tag/SHA `013ca9e40fcad3368249133b0fb4e00762b40625`, kernel string `5.15.216-android13_@oplusnize-lts`.
 - **Does not** support OnePlus ColorOS 14/15 or non-GKI devices.
-- If you build anything other than `android13-5.15` for `vermeer`, you're on your own — **a working boot.img backup is mandatory**.
+- If you build anything other than `android13-5.15` for `tapas`, you're on your own — **a working boot.img backup is mandatory**.
 
 ---
 
@@ -28,8 +28,8 @@ This project is developed, built and tested for **one target: `android13-5.15` o
 Builds on the work of others in the GKI/KernelSU ecosystem:
 
 - **[ShirkNeko/GKI_KernelSU_SUSFS](https://github.com/ShirkNeko/GKI_KernelSU_SUSFS)** — the build system this was originally forked from; the `build.py`/`kernel_builder.py` architecture traces back to it.
-- **[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra)** — the KernelSU implementation compiled into every kernel.
-- **[susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu)** and **[ShirkNeko/SukiSU_patch](https://github.com/ShirkNeko/SukiSU_patch)** — SUSFS kernel patches and supplementary SukiSU-Ultra patches (ZRAM, hooks).
+- **[BakaSU](https://github.com/Baka-SU/BakaSU)** — the KernelSU implementation used for root (loaded as `kernelsu.ko` in this fork).
+- **[susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu)** and **[ShirkNeko/SukiSU_patch](https://github.com/ShirkNeko/SukiSU_patch)** — SUSFS kernel patches and supplementary patches (ZRAM, hooks).
 - **[WildKernels/kernel_patches](https://github.com/WildKernels/kernel_patches)** — the BBRv3 backport patches (`common/bbrv3`).
 - **[ravindu644/Droidspaces-OSS](https://github.com/ravindu644/Droidspaces-OSS)** — the container-runtime app and kABI-compliant kernel patches; [WildKernels/GKI_KernelSU_SUSFS](https://github.com/WildKernels/GKI_KernelSU_SUSFS) was the reference for wiring Droidspaces into a GKI pipeline.
 
@@ -80,17 +80,15 @@ Exit code is `0` unless something is `MISSING`. Add `-v` to see the measured val
 
 ### Root & hiding
 
-**[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) (KernelSU-based root)** — kernel-level root solution, compiled into every build.
+**[BakaSU](https://github.com/Baka-SU/BakaSU) (KernelSU-based root)** — provided as a loadable kernel module (`kernelsu.ko`) injected into the init_boot ramdisk. The kernel Image itself does not contain root; see [Installation](#installation) for the LKM step.
 
-**[SUSFS v2.3.0](https://gitlab.com/simonpunk/susfs4ksu)** — kernel-level patches that assist root-hiding (hides suspicious paths/mount points, spoofs kernel stats/uname/cmdline, and more) together with its userspace module.
+**[SUSFS v2.3.0](https://gitlab.com/simonpunk/susfs4ksu)** — root-hiding support loaded as a separate kernel module (`susfs_guard_lkm.ko`, see [SUSFS](#susfs-userspace)). It is not compiled into the Image in LKM mode.
 
-**KPM (Kernel Patch Module)** — SukiSU KPM support is built in, so compatible KPM modules can be loaded at runtime.
-```bash
-su -c "cat /proc/kallsyms | grep sukisu_kpm_version"
-```
-Active if `sukisu_kpm_version` is listed.
+**KPM (Kernel Patch Module)** — not available in BakaSU LKM builds. `CONFIG_KPM` is a SukiSU-only option and is forced off by `--bakasu-lkm`.
 
-**Magic Mount** — overlay-based mounting that lets root modules modify the filesystem without touching the underlying partitions, improving compatibility and reducing detection surface.
+**Modules / metamodules** — BakaSU's module system is based on KernelSU metamodules; modules are installed and managed by the BakaSU manager.
+
+**Magic Mount** — not part of this LKM build.
 
 ### Networking
 
@@ -302,21 +300,21 @@ Active if it shows `CONFIG_ATH9K_HTC=m`. Full end-to-end check (adapter plugged 
 Handles dependency installation automatically — no manual setup, even on a clean Ubuntu/WSL install.
 
 ```bash
-git clone https://github.com/mansar1337/GKI_Kernel_SukiSU
-cd GKI_Kernel_SukiSU
+git clone https://github.com/zaneeeene/GKI_Kernel_BakaSU
+cd GKI_Kernel_BakaSU
 chmod +x build-kernel.sh cleanup-workspace.sh
 ./build-kernel.sh
 ```
 
-The tested releases pin known-good SukiSU-Ultra and SUSFS commits:
+This fork defaults to **BakaSU LKM** (`CONFIG_KSU=m`). Pin the BakaSU source ref with `--bakasu-ref` if needed; the SukiSU-era `--ksu-commit` / `--susfs-commit` flags are ignored in LKM mode:
 
 ```bash
-./build-kernel.sh --ksu-commit v4.2.0 --susfs-commit bca0d2333c1a7d717e7278b019d7af7ba1d16005
+./build-kernel.sh --bakasu-ref main
 ```
 
 You'll get a menu:
 ```
-1) Default (android13 / 5.15 / 211 / 2026-06)   ← the tested config for vermeer
+1) Default (android13 / 5.15 / 216 / 2026-09)   ← the current target for tapas
 2) Custom (choose your own versions)             ← anything non-android13-5.15 is untested
 3) All versions from matrix.json                 ← every "enabled": true entry, with a pass/fail summary
 ```
@@ -339,8 +337,9 @@ Reclaim disk space between builds (keeps shared repos and the AVB key intact):
 cd .github/workflows/scripts
 pip install PyYAML
 
-# Build the tested default (android13-5.15.211, vermeer)
-python3 build.py --android android13 --kernel 5.15 --sub-level 211 --os-patch 2026-06 --kernel-tag android13-5.15.211_r00 --ath9k
+# Build the current target (android13-5.15.216, tapas, BakaSU LKM)
+python3 build.py --android android13 --kernel 5.15 --sub-level 216 --os-patch 2026-09 \
+    --kernel-tag 013ca9e40fcad3368249133b0fb4e00762b40625 --bakasu-ref main --ath9k
 
 # List supported Android/Kernel combinations
 python3 build.py --list-configs
@@ -398,26 +397,23 @@ This is detected automatically from the tag format (a dot before the sub_level, 
 
 ---
 
-## Pinning SukiSU-Ultra / SUSFS (`--ksu-commit`, `--susfs-commit`)
+## Pinning BakaSU (`--bakasu-ref`)
 
-By default the build tracks the latest SukiSU-Ultra and susfs4ksu. That's usually what you want — but both are **fast-moving upstream projects**, and sometimes the newest commit doesn't build (an API change lands before the patches catch up, a hook breaks). When that happens, pin a **known-good commit** instead of waiting for an upstream fix. This is exactly how the tested releases are built:
+BakaSU LKM clones `Baka-SU/BakaSU` and checks out `main` by default. Pin a
+tag, branch, or commit with `--bakasu-ref` when a newer upstream commit
+breaks the build:
 
 ```bash
-./build-kernel.sh --ksu-commit v4.2.0 --susfs-commit bca0d2333c1a7d717e7278b019d7af7ba1d16005
+./build-kernel.sh --bakasu-ref main
+# or, for a specific ref:
+python3 build.py --android android13 --kernel 5.15 --sub-level 216 \
+    --os-patch 2026-09 --bakasu-ref <tag-or-commit>
 ```
 
-- **`--ksu-commit <ref>`** — pin SukiSU-Ultra's kernel-side source to a tag (e.g. `v4.2.0`) or commit hash.
-- **`--susfs-commit <ref>`** — pin susfs4ksu to a specific commit or tag.
-
-> **`--susfs-commit` is per-branch.** susfs4ksu keeps a **separate branch per GKI version**, each carrying only its own `50_add_susfs_in_gki-<android>-<kernel>.patch`. So a hash is valid for **exactly one** GKI branch — the build refuses a mismatched pin. `bca0d233…` is the `gki-android13-5.15` one; the `android12-5.10` equivalent is `ec785f4`.
->
-> To pin different commits per branch in one command, use the `branch=hash` form:
-> ```bash
-> ./build-kernel.sh --ksu-commit v4.2.0 \
->     --susfs-commit 'gki-android12-5.10=ec785f4,gki-android13-5.15=bca0d2333c1a7d717e7278b019d7af7ba1d16005'
-> ```
-
-Pin the two **together** — SUSFS's integration patch targets a specific SukiSU-Ultra source layout, so mixing a pinned SUSFS with a moving SukiSU (or vice versa) can drift out of sync.
+`--ksu-commit` and `--susfs-commit` belong to the legacy in-tree SukiSU
+mode (`--no-bakasu-lkm`) and are ignored in BakaSU LKM mode. There is no
+in-tree SUSFS to pin in LKM mode; SUSFS is the separate
+`susfs_guard_lkm.ko` module.
 
 ---
 
@@ -458,11 +454,14 @@ Tracked families: `android12-5.10`, `android13-5.15`, `android14-6.1`, `android1
 | `--lts` | Mark build as LTS-sourced. Rarely needed — auto-detected from `--kernel-tag` | auto |
 | `--ath9k` | Build ath9k_htc + ath9k_common + ath9k_hw + ath as out-of-tree modules for a TL-WN722N v1 (see [ath9k_htc details](#ath9khtc-details)) | False |
 | `--revision` | Android 12 revision (certified-boot reference downloads) | - |
-| `--ksu-version` | SukiSU-Ultra version (Stable/Dev) | Stable |
-| `--ksu-commit` | Pin a SukiSU-Ultra commit/tag | latest |
-| `--susfs-commit` | Pin a SUSFS commit (hash or HEAD~N) | latest |
+| `--bakasu-lkm` | Build BakaSU as a loadable module (`CONFIG_KSU=m`) | **on** in this fork |
+| `--no-bakasu-lkm` | Opt out and build SukiSU-Ultra in-tree (legacy mode) | off |
+| `--bakasu-ref` | BakaSU branch/tag/commit to build | main |
+| `--ksu-version` | SukiSU in-tree mode only; ignored in BakaSU LKM mode | Stable |
+| `--ksu-commit` | SukiSU in-tree mode only; ignored in BakaSU LKM mode | latest |
+| `--susfs-commit` | SukiSU in-tree SUSFS mode only; ignored in BakaSU LKM mode | latest |
 | `--zram` | Enable ZRAM (LZ4KD) | False |
-| `--no-kpm` | Disable KPM | False |
+| `--no-kpm` | Disable KPM (forced off in BakaSU LKM mode) | False |
 | `--bbg` | Enable Baseband-guard | False |
 | `--oplus-binder` | Enable OPlus binder strategy (PRIO_SKIP) | False |
 | `--oplus-kswapd` | Enable OPlus kswapd_opt (alloc tuning + stats) | False |
@@ -490,19 +489,23 @@ Tracked families: `android12-5.10`, `android13-5.15`, `android14-6.1`, `android1
 
 Each release attaches:
 
-1. **boot.img** — the ready-made boot image (`android13-5.15.211-2026-06-lto-full-r00-lts-boot.img`). Flash over `fastboot`. AVB-signed (see [AVB Signing](#avb-signing)).
+1. **boot.img** — the ready-made kernel image (`android13-5.15.216-2026-09-bakasu-lkm-lts-oplusnize-boot.img`). Flash over `fastboot`. AVB-signed (see [AVB Signing](#avb-signing)).
 2. **AnyKernel3.zip** — the same kernel packaged for flashing from recovery or a kernel-flasher app, without a PC.
-3. **ath9k_htc_vermeer.zip** — companion module for the ath9k adapter. Only needed with a TL-WN722N v1.
+3. **kernelsu-*.ko** — the BakaSU driver built from the same kernel tree. The unsigned/debug-stripped copy is the one to inject into init_boot; the signed build copy is kept for reference.
+4. **bakasu-lkm-modules.zip** — convenience bundle: `kernelsu.ko` + matching `susfs_guard_lkm-android13-5.15.ko` + README.
+5. **susfs_guard_lkm-modules.zip** — flashable KernelSU/BakaSU module that loads the SUSFS LKM at boot.
+6. **init_boot-\*-bakasu-lkm.img** — pre-patched init_boot images (stock firmware and LineageOS) with `ksuinit` + `kernelsu.ko` already injected. Flash the one matching your installed ROM.
+7. **ath9k_htc_vermeer.zip** — companion module for the ath9k adapter. Only needed with a TL-WN722N v1.
 
-Pick **one** of boot.img or AnyKernel3 — they install the same kernel two different ways.
+Pick **one** of boot.img or AnyKernel3 — they install the same kernel two different ways. The init_boot image is separate and is **required** for root in LKM mode.
 
 ---
 
 ## Installation
 
-> **This is a SukiSU-Ultra kernel.** Root is managed by the **[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) manager app** — install it (or update to it) so you get a root manager after flashing. See the [SUSFS notes](#susfs-userspace) at the end.
+> **This is a BakaSU LKM kernel.** The boot.img/AnyKernel3 contains the kernel only — it does **not** contain root. After flashing it, you must also flash a patched init_boot with `ksuinit` + `kernelsu.ko` (or use the BakaSU manager's LKM patcher). Root is managed by the **[BakaSU](https://github.com/Baka-SU/BakaSU) manager app**. See the [LKM init_boot step](#lkm-init-boot) below.
 >
-> **Always keep your current, working `boot.img` backed up before flashing anything.** If a flash goes wrong, see [Emergency Recovery](#emergency-recovery).
+> **Always keep your current, working `boot.img` and `init_boot.img` backed up before flashing anything.** If a flash goes wrong, see [Emergency Recovery](#emergency-recovery).
 
 ### Method 1 — boot.img via fastboot (PC)
 
@@ -510,13 +513,15 @@ Reboot to the bootloader (`adb reboot bootloader`, or Power + Volume Down), then
 
 **Permanent, both slots** (recommended for daily use):
 ```bash
-fastboot flash boot_ab android13-5.15.211-2026-06-lto-full-r00-lts-boot.img
+fastboot flash boot_ab android13-5.15.216-2026-09-bakasu-lkm-lts-oplusnize-boot.img
 ```
 
 **Try it first, without writing anything** (loads the image once into RAM; a normal reboot goes back to your existing kernel):
 ```bash
-fastboot boot android13-5.15.211-2026-06-lto-full-r00-lts-boot.img
+fastboot boot android13-5.15.216-2026-09-bakasu-lkm-lts-oplusnize-boot.img
 ```
+
+> **`fastboot boot` note:** this only boots the kernel image temporarily. Root still requires the patched init_boot, so use `fastboot flash` for the permanent install.
 
 > **Tip:** instead of typing the long filename, type `fastboot flash boot_ab ` (with the trailing space) and **drag-and-drop the `.img` file** into the terminal — it fills in the full path for you.
 >
@@ -528,27 +533,60 @@ Flash `AnyKernel3.zip` like any other flashable zip:
 
 - **Custom recovery** (TWRP/OrangeFox) — *Install* → pick the zip → swipe.
 - **[HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases)** or another kernel-flasher app — open the app, select the zip, flash.
-- **SukiSU-Ultra manager** — if your current manager supports flashing AnyKernel zips, you can install it from there directly.
+- **BakaSU manager** — if your current manager supports flashing AnyKernel zips, you can install it from there directly.
 
 Reboot when done.
 
+<a id="lkm-init-boot"></a>
+### Method 3 — LKM init_boot (required for root)
+
+BakaSU is a loadable module in this build. The kernel image alone boots without root;
+the driver is loaded by `ksuinit` from the patched init_boot ramdisk.
+
+**Option A — pre-patched image (easiest):**
+
+```bash
+# LineageOS 23.2 on tapas:
+fastboot flash init_boot_ab init_boot-lineage-bakasu-lkm.img
+# Stock HyperOS firmware instead:
+# fastboot flash init_boot_ab init_boot-stock-bakasu-lkm.img
+```
+
+These images contain `ksuinit` as `/init`, the original init as `/init.real`, and
+`kernelsu.ko`. Use the one that matches the ROM you are actually running.
+
+**Option B — BakaSU manager LKM patcher:**
+
+1. Install the BakaSU manager APK.
+2. Open it → **Not installed** → **LKM patching/installation**.
+3. Select your stock `init_boot.img` (matching your firmware).
+4. Flash the `KernelSU_patched_*.img` it writes to `init_boot_ab`.
+
+**Option C — manual `ksud` (advanced, needs a usable ksud):**
+
+```bash
+ksud boot-patch --image init_boot.img \
+    --module kernelsu-5.15.216-android13-unsigned-stripped.ko
+```
+
+Then flash the generated image to `init_boot_a`/`init_boot_b`.
+
 ### After flashing
 
-1. Open the **SukiSU-Ultra manager** — it should show the kernel as rooted.
-2. Confirm the kernel string is `5.15.211-android13-r00-lts` (shown in the manager, or `su -c uname -r`).
-3. Verify any features you care about with the commands in [Features & verification](#features--verification).
+1. Reboot and open the **BakaSU manager** — it should show root.
+2. Confirm the kernel string is `5.15.216-android13_@oplusnize-lts` (`su -c uname -r`).
+3. Confirm the driver is loaded: `su -c 'cat /proc/modules | grep kernelsu'` (BakaSU may hide it from `lsmod`).
 
 <a id="susfs-userspace"></a>
 ### SUSFS (userspace)
 
-The **kernel side** of SUSFS is already baked into this build (patched in from [`ShirkNeko/susfs4ksu`](https://github.com/ShirkNeko/susfs4ksu), per GKI branch) — you don't install anything for that part.
+In this BakaSU LKM build, SUSFS is **not** compiled into the kernel. It is supplied by the separate `susfs_guard_lkm.ko` module (from [inforcqb/susfs4ksu-lkm](https://github.com/inforcqb/susfs4ksu-lkm)) and loaded at boot by the `susfs_guard_lkm-modules.zip` KernelSU module.
 
-For **full SUSFS support** you also need the **userspace module**, which actually drives the hiding (mount cleanup, path spoofing, etc.). Flash [**sidex15/susfs4ksu-module**](https://github.com/sidex15/susfs4ksu-module) in the SukiSU-Ultra manager like any other root module:
+1. Flash **`susfs_guard_lkm-modules.zip`** in the BakaSU manager.
+2. Reboot.
+3. Configure the hiding from the SUSFS / [ReSuSFS](https://modules.kernelsu.org/en/modules/ReSuSFS) userspace module.
 
-- **Release build:** grab the latest zip from the module's [Releases](https://github.com/sidex15/susfs4ksu-module/releases).
-- **Latest build:** or the freshest artifact from its [Actions](https://github.com/sidex15/susfs4ksu-module/actions).
-
-Flash it, reboot, and configure the hiding from the SUSFS module / manager.
+If you specifically want in-tree SUSFS, build with `--no-bakasu-lkm` (legacy SukiSU in-tree mode) — but that is not the LKM method and cannot use this fork's BakaSU-LKM artifacts.
 
 ---
 
@@ -594,7 +632,7 @@ If the main BBRv3 patch doesn't apply cleanly (a branch's `net/ipv4` source has 
 
 **Wired up for `android12-5.10`, `android13-5.15`, `android14-6.1`** — though only `android13-5.15` is tested. GKI enforces a strict kABI checksum on struct layouts, so naively enabling `CONFIG_SYSVIPC`/`CONFIG_IPC_NS`/`CONFIG_POSIX_MQUEUE` without a matching patch causes an **immediate bootloop**. This flag applies the upstream kABI-safe patch (moving the relevant fields into Android's reserved padding slots) *before* turning those options on — three slot-layout variants are vendored and tried in order (strict, no-fuzz matching), since which `ANDROID_KABI_RESERVE` slots are free isn't identical across every respin; whichever one fits this exact source tree is used. If none fit, the build continues **without** Droidspaces rather than risking a silent kABI break (a `FAIL` on `Droidspaces` in the [patch status summary](#build-matrix) means this happened).
 
-Applied *after* SUSFS/SukiSU-Ultra in the build sequence deliberately — if there's ever a conflict over the same kABI reserve slots, it's this optional feature that loses, never the project's core functionality.
+Applied *after* SUSFS/BakaSU in the build sequence deliberately — if there's ever a conflict over the same kABI reserve slots, it's this optional feature that loses, never the project's core functionality.
 
 Verify and use it via the [Droidspaces app](https://github.com/ravindu644/Droidspaces-OSS) (Settings → Requirements → Check Requirements).
 
@@ -666,8 +704,9 @@ cleanup-workspace.sh           # Reclaims disk space between builds
 
 | Repository | Purpose |
 |------|------|
-| [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra) | SukiSU-Ultra source and setup script |
-| [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) | SUSFS kernel patches |
-| [SukiSU_patch](https://github.com/ShirkNeko/SukiSU_patch) | Additional SukiSU-Ultra patches (ZRAM, hooks) |
+| [BakaSU](https://github.com/Baka-SU/BakaSU) | BakaSU source and LKM driver |
+| [susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu) | SUSFS kernel patches (in-tree mode only) |
+| [inforcqb/susfs4ksu-lkm](https://github.com/inforcqb/susfs4ksu-lkm) | SUSFS loadable module (`susfs_guard_lkm.ko`) used by LKM mode |
+| [SukiSU_patch](https://github.com/ShirkNeko/SukiSU_patch) | Supplementary patches (ZRAM/LZ4KD, hooks) |
 | [AnyKernel3](https://github.com/WildPlusKernel/AnyKernel3) | Generic flashable package template |
 | [Baseband-guard](https://github.com/vc-teahouse/Baseband-guard) | Baseband security protection |
